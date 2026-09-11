@@ -36,6 +36,9 @@ type cpuUtilStat struct {
 	totalUtil     float64
 	sysUtil       float64
 	usrUtil       float64
+	// ready is false until a second sample establishes a real rate
+	// window. The first sample only records the baseline.
+	ready bool
 }
 
 type cpuUtilCollector struct {
@@ -73,13 +76,41 @@ func newCpuCollector() (*tracing.EventTracingAttr, error) {
 	}, nil
 }
 
+// computeCPUUtil converts two cumulative CPU samples into utilization
+// percentages. ok is false when the interval cannot produce a meaningful
+// rate: counter regression, a non-positive elapsed window, or deltas that
+// exceed the wall-clock capacity of the sample.
+func computeCPUUtil(prev, curr stats.CpuUsage, elapsed time.Duration, numCores float64) (total, usr, sys float64, ok bool) {
+	if elapsed <= 0 || numCores <= 0 {
+		return 0, 0, 0, false
+	}
+
+	// Usage, User, and System should increase monotonically. This defensive
+	// check prevents an unexpected reset from causing uint64 underflow.
+	if curr.Usage < prev.Usage ||
+		curr.User < prev.User ||
+		curr.System < prev.System {
+		return 0, 0, 0, false
+	}
+
+	deltaTotalTime := curr.Usage - prev.Usage
+	deltaUsrTime := curr.User - prev.User
+	deltaSysTime := curr.System - prev.System
+	// CpuUsage fields are microseconds; keep the denominator in the same unit.
+	deltaRealWorldTime := numCores * float64(elapsed.Microseconds())
+
+	if (float64(deltaTotalTime) > deltaRealWorldTime) || (float64(deltaUsrTime+deltaSysTime) > deltaRealWorldTime) {
+		return 0, 0, 0, false
+	}
+
+	total = float64(deltaTotalTime) * 100 / deltaRealWorldTime
+	usr = float64(deltaUsrTime) * 100 / deltaRealWorldTime
+	sys = float64(deltaSysTime) * 100 / deltaRealWorldTime
+	return total, usr, sys, true
+}
+
 func (c *cpuUtilCollector) updateDataCache(cache *cpuUtilStat, container *pod.Container, numCores float64) error {
-	var (
-		usrUtil    float64
-		sysUtil    float64
-		totalUtil  float64
-		cgroupPath string
-	)
+	var cgroupPath string
 
 	c.mutex.Lock()
 	defer c.mutex.Unlock()
@@ -98,42 +129,37 @@ func (c *cpuUtilCollector) updateDataCache(cache *cpuUtilStat, container *pod.Co
 		return err
 	}
 
-	// Usage, User, and System should increase monotonically. This defensive
-	// check prevents an unexpected reset from causing uint64 underflow.
-	if stat.Usage < cache.lastUsage.Usage ||
-		stat.User < cache.lastUsage.User ||
-		stat.System < cache.lastUsage.System {
+	// The first sample only records a baseline. Lifetime counters divided by
+	// wall-clock-since-zero report ~0% regardless of actual load, so skip
+	// publishing utilization until a real interval exists.
+	if cache.lastTimestamp.IsZero() {
 		cache.lastUsage = *stat
 		cache.lastTimestamp = now
 		return nil
 	}
 
-	deltaTotalTime := stat.Usage - cache.lastUsage.Usage
-	deltaUsrTime := stat.User - cache.lastUsage.User
-	deltaSysTime := stat.System - cache.lastUsage.System
-	deltaRealWorldTime := numCores * float64(now.Sub(cache.lastTimestamp).Microseconds())
-
-	if (float64(deltaTotalTime) > deltaRealWorldTime) || (float64(deltaUsrTime+deltaSysTime) > deltaRealWorldTime) {
-		cache.lastUsage = *stat
-		cache.lastTimestamp = now
-		return nil
-	}
-
-	totalUtil = float64(deltaTotalTime) * 100 / deltaRealWorldTime
-	usrUtil = float64(deltaUsrTime) * 100 / deltaRealWorldTime
-	sysUtil = float64(deltaSysTime) * 100 / deltaRealWorldTime
-
+	totalUtil, usrUtil, sysUtil, ok := computeCPUUtil(
+		cache.lastUsage, *stat, now.Sub(cache.lastTimestamp), numCores,
+	)
 	cache.lastUsage = *stat
+	cache.lastTimestamp = now
+	if !ok {
+		return nil
+	}
+
 	cache.totalUtil = totalUtil
 	cache.usrUtil = usrUtil
 	cache.sysUtil = sysUtil
-	cache.lastTimestamp = now
+	cache.ready = true
 	return nil
 }
 
 func (c *cpuUtilCollector) updateHostDataCache() ([]*metric.Data, error) {
 	if err := c.updateDataCache(&c.cpuDataCache, nil, c.numCores); err != nil {
 		return nil, err
+	}
+	if !c.cpuDataCache.ready {
+		return nil, nil
 	}
 
 	return []*metric.Data{
@@ -180,6 +206,12 @@ func (c *cpuUtilCollector) Update() ([]*metric.Data, error) {
 		metrics = append(
 			metrics,
 			metric.NewContainerGaugeData(container, "cores", numCores, "cpu core number for the containers", nil),
+		)
+		if !dataCache.ready {
+			continue
+		}
+		metrics = append(
+			metrics,
 			metric.NewContainerGaugeData(container, "usr", dataCache.usrUtil, "cpu usr for the containers", nil),
 			metric.NewContainerGaugeData(container, "sys", dataCache.sysUtil, "cpu sys for the containers", nil),
 			metric.NewContainerGaugeData(container, "total", dataCache.totalUtil, "cpu total for the containers", nil),
